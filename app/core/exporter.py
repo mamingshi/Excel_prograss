@@ -19,6 +19,7 @@ import pandas as pd
 from app.core.file_loader import ExcelFileLoader, file_sha256
 from app.models.export_data import CellChange, ExportPlan, ExportResult, ExportSnapshot, ExportMode
 from app.core.cleaner import apply_cleaning_rules
+from app.core.type_utils import values_equal
 from app.core.annotation_builder import build_duplicate_formula, build_annotation_values
 from app.core.column_inserter import ColumnMap, ColumnInsertionError, insert_comparison_columns
 from app.core.export_formula_builder import build_export_formula, build_passthrough_formula
@@ -48,13 +49,7 @@ def dataframe_column_to_excel_column(position: int) -> int:
 
 
 def _values_equal(before: object, after: object) -> bool:
-    # None / NaN / pd.NA 均为缺失值；避免 NaN != NaN 产生虚假修改。
-    before_missing, after_missing = bool(pd.isna(before)), bool(pd.isna(after))
-    if before_missing or after_missing:
-        return before_missing and after_missing
-    if isinstance(before, str) != isinstance(after, str):
-        return False
-    return bool(before == after)
+    return values_equal(before, after)
 
 
 def _validate_sheet_structure(sheet) -> None:

@@ -29,15 +29,16 @@ from PySide6.QtWidgets import (
 )
 
 from app.core.file_loader import ExcelPreview
+from app.core.batch_cleaner import BatchCleaningPreview, recommend_batch_configs
 from app.core.cleaner import CleaningPreview
 from app.core.annotation_builder import AnnotationPreview
 from app.core.detector import ColumnAnalysis
 from app.core.sheet_analyzer import SheetAnalysis
-from app.core.data_manager import DataStateError, PreparedAnnotationPreview, PreparedPreview, SheetScanSnapshot, WorkbookDataManager
+from app.core.data_manager import DataStateError, PreparedAnnotationPreview, PreparedBatchPreview, PreparedPreview, SheetScanSnapshot, WorkbookDataManager
 from app.core.exporter import (
     ExcelExportError, NO_CHANGES_MESSAGE, prepare_export, suggest_export_path, validate_export_paths,
 )
-from app.models.cleaning_action import AnnotationAction, CleaningAction
+from app.models.cleaning_action import AnnotationAction, BatchCleaningAction, CleaningAction
 from app.models.dataframe_model import DataFrameModel
 from app.models.export_data import ExportResult
 from app.ui.cell_preview_dialog import CellPreviewDialog
@@ -48,11 +49,13 @@ from app.ui.diagnosis_panel import DiagnosisPanel
 from app.ui.cleaning_panel import CleaningPanel
 from app.ui.cleaning_preview_panel import CleaningPreviewPanel
 from app.ui.cleaning_worker import CleaningPreviewWorker
+from app.ui.batch_worker import BatchPreviewWorker
+from app.ui.batch_cleaning_panel import BatchCleaningPanel
 from app.ui.annotation_worker import AnnotationPreviewWorker
 from app.ui.annotation_preview_panel import AnnotationPreviewPanel
 from app.ui.load_worker import ExcelLoadWorker
 from app.ui.export_worker import ExcelExportWorker
-from app.ui.confirmation_dialogs import confirm_annotation, confirm_apply, confirm_restore, confirm_export, show_export_success
+from app.ui.confirmation_dialogs import confirm_annotation, confirm_apply, confirm_batch_apply, confirm_restore, confirm_export, show_export_success
 from app.ui.theme import apply_theme, icon, primary_button, style_table
 
 
@@ -72,6 +75,11 @@ class MainWindow(QMainWindow):
         self._analysis_completion_message: str | None = None
         self._worker: ExcelLoadWorker | None = None
         self._analysis_worker: ColumnAnalysisWorker | None = None
+        self._batch_worker: BatchPreviewWorker | None = None
+        self._batch_snapshot: SheetScanSnapshot | None = None
+        self._prepared_batch: PreparedBatchPreview | None = None
+        self._batch_completion_message: str | None = None
+        self._scan_for_batch = False
         self._scan_worker: SheetAnalysisWorker | None = None
         self._scan_snapshot: SheetScanSnapshot | None = None
         self._scan_completion_message: str | None = None
@@ -121,7 +129,7 @@ class MainWindow(QMainWindow):
         primary_button(self.export_button, "export")
         self.export_button.setToolTip("选择原列更新或新增公式对照列，将所有 Sheet 的已应用清洗及辅助列另存为新 .xlsx 文件。")
         heading.addWidget(self.export_button)
-        for text, tone in (("V0.8", "neutral"), ("另存为新文件", "success")):
+        for text, tone in (("V0.9", "neutral"), ("另存为新文件", "success")):
             badge = QLabel(text)
             badge.setProperty("role", "badge")
             badge.setProperty("tone", tone)
@@ -236,6 +244,8 @@ class MainWindow(QMainWindow):
         self.results_tabs.addTab(self.cleaning_preview_panel, "清洗预览")
         self.annotation_preview_panel = AnnotationPreviewPanel(self)
         self.results_tabs.addTab(self.annotation_preview_panel, "辅助列预览")
+        self.batch_panel = BatchCleaningPanel(self)
+        self.results_tabs.addTab(self.batch_panel, "批量清洗")
         # 各张主表共享整块工作区，切换页面只改变展示，不重置数据或结果。
         self._sidebar_preferences = {
             self.raw_data_page: False,
@@ -243,6 +253,7 @@ class MainWindow(QMainWindow):
             self.diagnosis_panel: False,
             self.cleaning_preview_panel: True,
             self.annotation_preview_panel: False,
+            self.batch_panel: False,
         }
         self.cleaning_panel = CleaningPanel(self)
         # 侧栏可滚动，小窗口下规则和公式仍然能完整访问。
@@ -278,6 +289,13 @@ class MainWindow(QMainWindow):
         self.statusBar().addPermanentWidget(self.modification_label)
 
     def _connect_signals(self) -> None:
+        self.batch_panel.scan_requested.connect(self._request_batch_scan)
+        self.batch_panel.preview_requested.connect(self._start_batch_preview)
+        self.batch_panel.apply_requested.connect(self._apply_batch_cleaning)
+        self.batch_panel.cancel_requested.connect(self._cancel_batch_task)
+        self.batch_panel.configuration_changed.connect(self._clear_batch_preview)
+        self.batch_panel.duplicate_requested.connect(self._request_batch_duplicate)
+        self.sheet_overview_panel.batch_requested.connect(self._open_batch_workspace)
         self.open_button.clicked.connect(self._open_excel)
         self.scan_button.clicked.connect(self._start_sheet_scan)
         self.sheet_overview_panel.cancel_requested.connect(self._cancel_sheet_scan)
@@ -305,7 +323,7 @@ class MainWindow(QMainWindow):
     def _is_busy(self) -> bool:
         return any(worker is not None for worker in (
             self._worker, self._analysis_worker, self._cleaning_worker, self._export_worker,
-            self._scan_worker, self._annotation_worker,
+            self._scan_worker, self._annotation_worker, self._batch_worker,
         ))
 
     def _update_controls(self) -> None:
@@ -321,6 +339,12 @@ class MainWindow(QMainWindow):
         )
         # 后台任务期间固定数据和当前列，防止结果返回到另一份数据上。
         self.table.setEnabled(not busy)
+        self.batch_panel.set_busy(
+            busy, task_active=self._batch_worker is not None
+            or (self._scan_for_batch and self._scan_worker is not None),
+        )
+        self.batch_panel.apply_button.setEnabled(not busy and self._can_apply_batch())
+        self.cleaning_toggle_button.setEnabled(self.results_tabs.currentWidget() is not self.batch_panel)
         self.diagnosis_panel.set_busy(busy)
         self.cleaning_panel.set_busy(busy)
         self.cleaning_preview_panel.apply_button.setEnabled(not busy and self._can_apply_preview())
@@ -358,6 +382,8 @@ class MainWindow(QMainWindow):
 
     def _current_table(self) -> QTableView:
         page = self.results_tabs.currentWidget()
+        if page is self.batch_panel:
+            return self.batch_panel.current_table
         if page is self.sheet_overview_panel:
             return self.sheet_overview_panel.table
         if page is self.diagnosis_panel:
@@ -407,12 +433,18 @@ class MainWindow(QMainWindow):
         )
 
     @Slot()
-    def _start_annotation_preview(self, kind: str = "duplicate") -> None:
+    def _start_annotation_preview(self, kind: str = "duplicate", *, use_sheet_scan: bool = False) -> None:
         if (self._is_busy() or self._preview is None or self.selected_column is None
                 or self.selected_column >= self.data_manager.original_df.shape[1]):
             return
         analysis = self.cleaning_panel.analysis
-        if analysis is None or (kind == "duplicate" and analysis.counts["重复值"] == 0):
+        duplicate_count = analysis.counts["重复值"] if analysis is not None else 0
+        if use_sheet_scan and analysis is None:
+            state = self.data_manager.current_data
+            cache = state.scan_cache
+            if cache is not None and cache.revision == state.revision:
+                duplicate_count = cache.result.columns[self.selected_column].duplicates
+        if (kind == "duplicate" and duplicate_count == 0) or (kind != "duplicate" and analysis is None):
             return
         worker = AnnotationPreviewWorker(
             self.data_manager.working_df.copy(deep=False), self.selected_column, self,
@@ -546,6 +578,9 @@ class MainWindow(QMainWindow):
         if isinstance(action, AnnotationAction):
             column = action.source_column_index
             message = f"已撤销{action.sheet_name}工作表的{action.column_name}辅助列"
+        elif isinstance(action, BatchCleaningAction):
+            column = None
+            message = f"已撤销{action.sheet_name}工作表的整批清洗"
         elif isinstance(action, CleaningAction):
             column = action.column_index
             message = f"已撤销{action.sheet_name}工作表的{action.column_name}列清洗"
@@ -674,6 +709,146 @@ class MainWindow(QMainWindow):
         if self._close_requested:
             self.close()
 
+    def _refresh_batch_workspace(self) -> None:
+        self._prepared_batch = None
+        state = self.data_manager.current_data
+        cache = state.scan_cache
+        analysis = cache.result if cache and cache.revision == state.revision else None
+        configs = recommend_batch_configs(
+            state.working_df.columns, analysis, original_column_count=state.original_df.shape[1],
+        )
+        self.batch_panel.set_sheet(self.data_manager.current_sheet, configs, scanned=analysis is not None)
+
+    @Slot()
+    def _open_batch_workspace(self) -> None:
+        if self._preview is not None:
+            self.results_tabs.setCurrentWidget(self.batch_panel)
+
+    @Slot()
+    def _request_batch_scan(self) -> None:
+        if self._is_busy() or self._preview is None:
+            return
+        self._scan_for_batch = True
+        self.batch_panel.begin_task("正在扫描并生成逐列建议……", self._model.columnCount())
+        self._start_sheet_scan()
+        if self._scan_worker is None:
+            self._scan_for_batch = False
+
+    @Slot()
+    def _clear_batch_preview(self) -> None:
+        self._prepared_batch = None
+        self.batch_panel.clear_preview()
+        self._update_controls()
+
+    def _can_apply_batch(self) -> bool:
+        preview = self._prepared_batch
+        return (
+            preview is not None and self.batch_panel.result is preview.result
+            and preview.result.changed_cell_count > 0
+            and preview.result.configs == tuple(config for config in self.batch_panel.configs if config.enabled)
+            and self.data_manager.is_preview_current(preview)
+        )
+
+    @Slot()
+    def _start_batch_preview(self) -> None:
+        if self._is_busy() or self._preview is None or not self.batch_panel.scanned:
+            return
+        self._clear_batch_preview()
+        self._batch_snapshot = self.data_manager.prepare_sheet_scan()
+        worker = BatchPreviewWorker(
+            self._batch_snapshot, self.batch_panel.configs, self.data_manager.original_df.shape[1], self,
+        )
+        self._batch_worker = worker
+        self._batch_completion_message = None
+        self.batch_panel.begin_task(
+            "正在生成批量预览……", sum(config.enabled for config in self.batch_panel.configs),
+        )
+        worker.progress.connect(self.batch_panel.show_progress)
+        worker.succeeded.connect(self._show_batch_preview)
+        worker.failed.connect(self._show_batch_error)
+        worker.cancelled.connect(self._show_batch_cancelled)
+        worker.finished.connect(self._finish_batch_preview)
+        worker.finished.connect(worker.deleteLater)
+        self._update_controls()
+        self.statusBar().showMessage("正在生成批量预览……")
+        worker.start()
+
+    @Slot(object)
+    def _show_batch_preview(self, result: BatchCleaningPreview) -> None:
+        if self._close_requested or self._batch_worker.isInterruptionRequested():
+            return
+        try:
+            self._prepared_batch = self.data_manager.prepare_batch_preview(self._batch_snapshot, result)
+        except Exception as error:
+            self._show_batch_error(str(error))
+            return
+        self.batch_panel.show_result(result)
+        self._batch_completion_message = (
+            f"批量预览完成：预计修改 {result.changed_cell_count} 个单元格，涉及 {result.changed_row_count} 行。"
+        )
+        self._update_controls()
+
+    @Slot(str)
+    def _show_batch_error(self, detail: str) -> None:
+        self._prepared_batch = None
+        self._batch_completion_message = "批量预览未生成，工作副本保持不变。"
+        if not self._close_requested:
+            self.batch_panel.show_notice(detail, "warning")
+            self._show_error_dialog("无法生成批量预览", self._batch_completion_message, detail)
+
+    @Slot()
+    def _show_batch_cancelled(self) -> None:
+        self._prepared_batch = None
+        self._batch_completion_message = "批量预览已取消，工作副本保持不变。"
+        if not self._close_requested:
+            self.batch_panel.clear_preview()
+            self.batch_panel.show_notice(self._batch_completion_message)
+
+    @Slot()
+    def _finish_batch_preview(self) -> None:
+        self._batch_worker = None
+        self._batch_snapshot = None
+        self._update_controls()
+        if self._batch_completion_message:
+            self.statusBar().showMessage(self._batch_completion_message, 10000)
+        if self._close_requested:
+            self.close()
+
+    @Slot()
+    def _cancel_batch_task(self) -> None:
+        if self._batch_worker is not None:
+            self._batch_worker.requestInterruption()
+        elif self._scan_for_batch:
+            self._cancel_sheet_scan()
+
+    @Slot()
+    def _apply_batch_cleaning(self) -> None:
+        if self._is_busy() or not self._can_apply_batch():
+            return
+        preview = self._prepared_batch
+        if not confirm_batch_apply(self, preview.result):
+            return
+        if self._is_busy() or self._prepared_batch is not preview or not self._can_apply_batch():
+            self.statusBar().showMessage("批量预览已变化，请重新生成后再应用。", 6000)
+            return
+        try:
+            action = self.data_manager.apply_batch_preview(preview)
+        except Exception as error:
+            self._show_error_dialog("无法应用批量清洗", "应用失败，工作副本未被修改。", str(error))
+            return
+        if action is not None:
+            self._refresh_after_change(
+                None, f"批量清洗完成，共修改 {preview.result.changed_cell_count} 个单元格，"
+                f"涉及 {preview.result.changed_row_count} 行。",
+            )
+
+    @Slot(int)
+    def _request_batch_duplicate(self, column: int) -> None:
+        if self._is_busy():
+            return
+        self._select_column(column)
+        self._start_annotation_preview(use_sheet_scan=True)
+
     def _refresh_sheet_overview(self) -> None:
         state = self.data_manager.current_data
         cache = state.scan_cache
@@ -702,7 +877,7 @@ class MainWindow(QMainWindow):
         self._scan_completion_message = None
         self._scan_cancel_requested = False
         self.sheet_overview_panel.begin_scan(snapshot.dataframe.shape[1])
-        self.results_tabs.setCurrentWidget(self.sheet_overview_panel)
+        self.results_tabs.setCurrentWidget(self.batch_panel if self._scan_for_batch else self.sheet_overview_panel)
         worker.progress.connect(self._show_scan_progress)
         worker.succeeded.connect(self._show_sheet_scan)
         worker.failed.connect(self._show_scan_error)
@@ -717,6 +892,8 @@ class MainWindow(QMainWindow):
     def _show_scan_progress(self, completed: int, total: int, column_name: str) -> None:
         if not self._close_requested:
             self.sheet_overview_panel.show_progress(completed, total, column_name)
+            if self._scan_for_batch:
+                self.batch_panel.show_progress(completed, total, column_name)
 
     @Slot(object)
     def _show_sheet_scan(self, result: SheetAnalysis) -> None:
@@ -731,6 +908,7 @@ class MainWindow(QMainWindow):
             self._show_scan_error(str(error))
             return
         self._refresh_sheet_overview()
+        self._refresh_batch_workspace()
         self._scan_completion_message = (
             f"扫描完成 · 字段数：{result.column_count} · 发现问题字段：{result.problem_column_count}"
             f" · 正常字段：{result.normal_column_count}"
@@ -756,6 +934,8 @@ class MainWindow(QMainWindow):
             message += "当前保留上次完整扫描；数据修改后仍需重新扫描。" if stale else "当前显示上次完整扫描结果。"
         self.sheet_overview_panel.show_notice(message, "warning" if stale else "neutral")
         self._scan_completion_message = "扫描已取消"
+        if self._scan_for_batch:
+            self.batch_panel.show_notice(message)
 
     @Slot(str)
     def _show_scan_error(self, detail: str) -> None:
@@ -763,12 +943,15 @@ class MainWindow(QMainWindow):
         if not self._close_requested:
             self._refresh_sheet_overview()
             self.sheet_overview_panel.show_notice(self._scan_completion_message, "warning")
+            if self._scan_for_batch:
+                self.batch_panel.show_notice(self._scan_completion_message, "warning")
             self._show_error_dialog("数据质量扫描失败", self._scan_completion_message, detail)
 
     @Slot()
     def _finish_sheet_scan(self) -> None:
         self._scan_worker = None
         self._scan_snapshot = None
+        self._scan_for_batch = False
         self._update_controls()
         if self._scan_completion_message:
             self.statusBar().showMessage(self._scan_completion_message, 10000)
@@ -913,6 +1096,7 @@ class MainWindow(QMainWindow):
         self.diagnosis_panel.set_column(None, self._model.rowCount())
         self.cleaning_panel.set_column(None, None)
         self._refresh_sheet_overview()
+        self._refresh_batch_workspace()
         self.results_tabs.setCurrentWidget(self.raw_data_page)
         self.file_label.setText(f"当前文件名：{preview.file_path.name}")
         self.file_label.setToolTip(str(preview.file_path))
@@ -976,6 +1160,8 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event: QCloseEvent) -> None:
         if self._is_busy():
+            if self._batch_worker is not None:
+                self._batch_worker.requestInterruption()
             if self._scan_worker is not None:
                 self._scan_worker.requestInterruption()
             # 等待后台任务结束后关闭，避免仍在运行的 QThread 被销毁。

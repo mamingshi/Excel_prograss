@@ -6,10 +6,12 @@ from pathlib import Path
 import pandas as pd
 
 from app.core.cleaner import CleaningPreview, CleaningRules
+from app.core.batch_cleaner import BatchCleaningPreview, BatchColumnChange, config_to_rules
+from app.core.type_utils import values_equal
 from app.core.annotation_builder import AnnotationColumn, AnnotationPreview, build_annotation_values, generate_annotation_name
 from app.core.file_loader import ExcelPreview
 from app.core.sheet_analyzer import SheetAnalysis
-from app.models.cleaning_action import AnnotationAction, CleaningAction, HistoryAction, RestoreAction
+from app.models.cleaning_action import AnnotationAction, BatchCleaningAction, CleaningAction, HistoryAction, RestoreAction
 from app.models.export_data import ExportSnapshot, SheetExportSnapshot
 
 
@@ -68,6 +70,14 @@ class PreparedAnnotationPreview:
     @property
     def column_index(self) -> int:
         return self.result.annotation.source_column_index
+
+
+@dataclass(frozen=True)
+class PreparedBatchPreview:
+    generation: int
+    sheet_name: str
+    revision: int
+    result: BatchCleaningPreview
 
 
 class WorkbookDataManager:
@@ -260,7 +270,7 @@ class WorkbookDataManager:
             state.revision, result, before, after,
         )
 
-    def is_preview_current(self, preview: PreparedPreview | PreparedAnnotationPreview) -> bool:
+    def is_preview_current(self, preview: PreparedPreview | PreparedAnnotationPreview | PreparedBatchPreview) -> bool:
         return (
             preview.generation == self._generation
             and preview.sheet_name == self.current_sheet
@@ -298,6 +308,79 @@ class WorkbookDataManager:
         self.undo_stack = history
         return action
 
+    def prepare_batch_preview(
+        self, snapshot: SheetScanSnapshot, result: BatchCleaningPreview,
+    ) -> PreparedBatchPreview:
+        if not self.is_sheet_scan_current(snapshot):
+            raise DataStateError("批量预览已失效，请重新生成。")
+        state = self.current_data
+        if result.sheet_name != self.current_sheet or result.row_count != len(state.working_df):
+            raise DataStateError("批量预览与当前工作表不匹配。")
+        configs = {config.column_index: config for config in result.configs}
+        if len(configs) != len(result.configs) or not configs:
+            raise DataStateError("批量字段配置不完整，请重新生成。")
+        for index, config in configs.items():
+            if (not config.enabled or config.is_generated or not 0 <= index < state.original_df.shape[1]
+                    or str(state.working_df.columns[index]) != config.column_name):
+                raise DataStateError("批量字段配置已变化，请重新生成。")
+            config_to_rules(config)
+        seen, rows = set(), set()
+        for change in result.column_changes:
+            index = change.column_index
+            if index in seen or index not in configs:
+                raise DataStateError("批量预览包含重复或未知字段。")
+            seen.add(index)
+            before, after = change.before_values, change.after_values
+            current = state.working_df.iloc[:, index]
+            if (not current.equals(before) or len(after) != len(before) or not before.index.equals(after.index)
+                    or before.name != after.name or change.column_name != str(current.name)
+                    or change.rules != config_to_rules(configs[index])):
+                raise DataStateError("批量预览与当前字段内容不一致，请重新生成。")
+            affected = tuple(position for position, (old, new) in enumerate(zip(before, after))
+                             if not values_equal(old, new))
+            if affected != change.affected_indices or not affected:
+                raise DataStateError("批量预览变化统计不一致，请重新生成。")
+            rows.update(position + 2 for position in affected)
+        if tuple(sorted(rows)) != result.affected_rows:
+            raise DataStateError("批量预览行数统计不一致，请重新生成。")
+        return PreparedBatchPreview(self._generation, self.current_sheet, state.revision, result)
+
+    def apply_batch_preview(self, preview: PreparedBatchPreview) -> BatchCleaningAction | None:
+        """所有列和辅助标注先写入一个候选副本，成功后整体提交一次历史。"""
+        if not self.is_preview_current(preview):
+            raise DataStateError("批量预览已失效，请重新生成后再应用。")
+        self.prepare_batch_preview(self.prepare_sheet_scan(), preview.result)
+        state = self.current_data
+        if not preview.result.column_changes:
+            return None
+        changes = tuple(BatchColumnChange(
+            change.column_index, change.column_name, change.before_values.copy(deep=True),
+            change.after_values.copy(deep=True), change.affected_indices, change.rules,
+        ) for change in preview.result.column_changes)
+        action = BatchCleaningAction(
+            preview.sheet_name, changes, state.operation_count,
+            frozenset(state.modified_columns), dict(state.column_rules),
+        )
+        updated = state.working_df.copy(deep=True)
+        modified_columns = set(state.modified_columns)
+        column_rules = dict(state.column_rules)
+        for change in changes:
+            updated.isetitem(change.column_index, change.after_values.copy(deep=True))
+            if updated.iloc[:, change.column_index].equals(state.original_df.iloc[:, change.column_index]):
+                modified_columns.discard(change.column_index)
+            else:
+                modified_columns.add(change.column_index)
+            column_rules[change.column_index] = column_rules.get(change.column_index, ()) + (change.rules,)
+        self._refresh_annotations(updated, state.annotations)
+        history = self.undo_stack + [action]
+        state.working_df = updated
+        state.modified_columns = modified_columns
+        state.column_rules = column_rules
+        state.operation_count += 1
+        state.revision += 1
+        self.undo_stack = history
+        return action
+
     @staticmethod
     def _replace_column(dataframe: pd.DataFrame, column_index: int, values: pd.Series) -> pd.DataFrame:
         # 先构造完整候选副本，赋值失败时保留原有工作数据及撤销历史。
@@ -329,6 +412,14 @@ class WorkbookDataManager:
             count = action.previous_operation_count
             modified_columns = set(state.modified_columns)
             column_rules = dict(state.column_rules)
+        elif isinstance(action, BatchCleaningAction):
+            updated = state.working_df.copy(deep=True)
+            for change in action.column_changes:
+                updated.isetitem(change.column_index, change.before_values.copy(deep=True))
+            self._refresh_annotations(updated, annotations)
+            count = action.previous_operation_count
+            modified_columns = set(action.previous_modified_columns)
+            column_rules = dict(action.previous_column_rules)
         elif isinstance(action, CleaningAction):
             updated = self._replace_column(state.working_df, action.column_index, action.before_values)
             self._refresh_annotations(updated, annotations, action.column_index)

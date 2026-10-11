@@ -12,7 +12,8 @@ HiddenStrategy = Literal["space", "delete"]
 # 清洗和参考公式共用顺序定义，首尾普通空格始终最后处理。
 RULE_ORDER = ("nbsp", "tab", "newline", "carriage_return", "outer_spaces")
 TYPE_RULE_ORDER = ("fullwidth", "numeric_conversion", "date_normalize")
-ALL_RULE_ORDER = ("fullwidth",) + RULE_ORDER + ("numeric_conversion", "date_normalize")
+# 单列与批量共用：先处理隐藏字符，再转换全角，最后去首尾空格和转换类型。
+ALL_RULE_ORDER = RULE_ORDER[:-1] + ("fullwidth", "outer_spaces", "numeric_conversion", "date_normalize")
 RULE_LABELS = {
     "nbsp": "CHAR(160) → 普通空格",
     "tab": "Tab → 普通空格",

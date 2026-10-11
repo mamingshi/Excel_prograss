@@ -19,6 +19,16 @@ ISO_TIME = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}[ T][0-9]{2}:[0-9]{2}(?::[0-9]
 DATE_THRESHOLD = 0.60
 
 
+def values_equal(before: object, after: object) -> bool:
+    """预览校验与导出共用：缺失值相等，数字与文本数字不同。"""
+    before_missing, after_missing = bool(pd.isna(before)), bool(pd.isna(after))
+    if before_missing or after_missing:
+        return before_missing and after_missing
+    if isinstance(before, str) != isinstance(after, str):
+        return False
+    return bool(before == after)
+
+
 def is_empty_value(value) -> bool:
     if isinstance(value, str):
         return value == ""

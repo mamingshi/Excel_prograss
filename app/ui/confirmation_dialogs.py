@@ -4,9 +4,10 @@ from pathlib import Path
 
 from PySide6.QtCore import Qt, QUrl
 from PySide6.QtGui import QDesktopServices
-from PySide6.QtWidgets import QDialog, QHBoxLayout, QLabel, QMessageBox, QPushButton, QRadioButton, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QDialog, QHBoxLayout, QLabel, QMessageBox, QPlainTextEdit, QPushButton, QRadioButton, QVBoxLayout, QWidget
 
 from app.core.cleaner import CleaningPreview, ALL_RULE_ORDER, rule_label
+from app.core.batch_cleaner import BatchCleaningPreview, rules_description
 from app.core.annotation_builder import AnnotationPreview
 from app.models.export_data import ExportMode, ExportPlan, ExportResult
 from app.ui.theme import primary_button
@@ -46,6 +47,43 @@ def confirm_apply(parent: QWidget, sheet_name: str, column_name: str, preview: C
         + ("\n带前导0或存在精度风险的文本数字将保留，不批量转换。" if preview.rules.numeric_conversion else ""),
         "确认应用",
     )
+
+
+def confirm_batch_apply(parent: QWidget, preview: BatchCleaningPreview) -> bool:
+    dialog = QDialog(parent)
+    dialog.setWindowTitle("确认应用批量清洗")
+    dialog.resize(600, 460)
+    layout = QVBoxLayout(dialog)
+    summary = QLabel(
+        f"即将应用批量清洗\n工作表：{preview.sheet_name}\n字段：{len(preview.configs)}"
+        f"\n修改单元格：{preview.changed_cell_count}\n修改数据行：{preview.changed_row_count}"
+    )
+    summary.setTextFormat(Qt.TextFormat.PlainText)
+    layout.addWidget(summary)
+    rules = QPlainTextEdit()
+    rules.setReadOnly(True)
+    rules.setPlainText("\n".join(
+        f"{config.column_name}：{rules_description(config)}" for config in preview.configs
+    ))
+    layout.addWidget(rules, 1)
+    note = QLabel("操作只会修改当前内存工作副本，不会覆盖原 Excel 文件，并且支持一次撤销整批操作。")
+    note.setTextFormat(Qt.TextFormat.PlainText)
+    note.setWordWrap(True)
+    layout.addWidget(note)
+    buttons = QHBoxLayout()
+    buttons.addStretch()
+    cancel = QPushButton("取消")
+    accept = QPushButton("确认应用")
+    cancel.setDefault(True)
+    accept.setAutoDefault(False)
+    primary_button(accept, "check")
+    buttons.addWidget(cancel)
+    buttons.addWidget(accept)
+    layout.addLayout(buttons)
+    cancel.clicked.connect(dialog.reject)
+    accept.clicked.connect(dialog.accept)
+    cancel.setFocus()
+    return dialog.exec() == QDialog.DialogCode.Accepted
 
 
 def confirm_annotation(parent: QWidget, sheet_name: str, preview: AnnotationPreview) -> bool:

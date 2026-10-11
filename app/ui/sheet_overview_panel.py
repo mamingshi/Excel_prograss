@@ -17,6 +17,7 @@ STALE_SCAN_MESSAGE = "当前数据已发生修改，请重新扫描工作表以�
 class SheetOverviewPanel(QWidget):
     column_requested = Signal(int)
     cancel_requested = Signal()
+    batch_requested = Signal()
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -34,6 +35,9 @@ class SheetOverviewPanel(QWidget):
         self.summary_label.setWordWrap(True)
         self.summary_label.setProperty("role", "sectionTitle")
         controls.addWidget(self.summary_label, 1)
+        self.batch_button = QPushButton("打开批量清洗工作台")
+        self.batch_button.clicked.connect(self.batch_requested.emit)
+        controls.addWidget(self.batch_button)
         self.cancel_button = QPushButton("取消扫描")
         self.cancel_button.clicked.connect(self.cancel_requested.emit)
         self.cancel_button.hide()
@@ -107,6 +111,7 @@ class SheetOverviewPanel(QWidget):
         self.set_busy(False)
 
     def set_busy(self, busy: bool, *, scanning: bool = False) -> None:
+        self.batch_button.setEnabled(not busy and self._has_sheet)
         self.table.setEnabled(not busy and self.result is not None and not self._stale)
         self.cancel_button.setVisible(scanning)
         self.cancel_button.setEnabled(scanning and not self._cancel_pending)

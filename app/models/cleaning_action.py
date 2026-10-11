@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 import pandas as pd
 
 from app.core.cleaner import CleaningRules
+from app.core.batch_cleaner import BatchColumnChange
 from app.core.annotation_builder import AnnotationColumn
 
 
@@ -47,4 +48,24 @@ class AnnotationAction:
     operation_name: str = "添加重复检查列"
 
 
-HistoryAction = CleaningAction | RestoreAction | AnnotationAction
+@dataclass(frozen=True)
+class BatchCleaningAction:
+    sheet_name: str
+    column_changes: tuple[BatchColumnChange, ...]
+    previous_operation_count: int
+    previous_modified_columns: frozenset[int]
+    previous_column_rules: dict[int, tuple[CleaningRules, ...]]
+    timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    operation_name: str = "批量清洗"
+
+    @property
+    def rules_by_column(self) -> dict[int, CleaningRules]:
+        return {change.column_index: change.rules for change in self.column_changes}
+
+    @property
+    def affected_cells(self) -> tuple[tuple[int, int], ...]:
+        return tuple((row + 2, change.column_index) for change in self.column_changes
+                     for row in change.affected_indices)
+
+
+HistoryAction = CleaningAction | RestoreAction | AnnotationAction | BatchCleaningAction

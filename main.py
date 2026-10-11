@@ -12,7 +12,7 @@ from app.ui.theme import apply_theme
 def main() -> int:
     application = QApplication(sys.argv)
     application.setApplicationName("Excel 数据清洗助手")
-    application.setApplicationVersion("0.8")
+    application.setApplicationVersion("0.9")
     apply_theme(application)
     # 为 Qt 自带对话框中的按钮和详情标签加载中文翻译。
     translator = QTranslator(application)
