@@ -30,7 +30,7 @@ from PySide6.QtWidgets import (
 
 from app.core.file_loader import ExcelPreview
 from app.core.batch_cleaner import BatchCleaningPreview, recommend_batch_configs
-from app.core.cleaner import CleaningPreview
+from app.core.cleaner import ALL_RULE_ORDER, CleaningPreview
 from app.core.annotation_builder import AnnotationPreview
 from app.core.detector import ColumnAnalysis
 from app.core.sheet_analyzer import SheetAnalysis
@@ -42,6 +42,7 @@ from app.models.cleaning_action import AnnotationAction, BatchCleaningAction, Cl
 from app.models.dataframe_model import DataFrameModel
 from app.models.export_data import ExportResult
 from app.ui.cell_preview_dialog import CellPreviewDialog
+from app.ui.manual_formula_dialog import ManualFormulaDialog
 from app.ui.analysis_worker import ColumnAnalysisWorker
 from app.ui.sheet_analysis_worker import SheetAnalysisWorker
 from app.ui.sheet_overview_panel import SheetOverviewPanel
@@ -125,11 +126,14 @@ class MainWindow(QMainWindow):
         self.restore_button.setToolTip("将当前工作表的工作副本恢复为原始快照。")
         heading.addWidget(self.undo_button)
         heading.addWidget(self.restore_button)
+        self.formula_button = QPushButton("查看 / 复制公式")
+        self.formula_button.setToolTip("独立生成清洗公式，复制后自行粘贴到 Excel；无需检测、应用或导出。")
+        heading.addWidget(self.formula_button)
         self.export_button = QPushButton("导出清洗结果")
         primary_button(self.export_button, "export")
         self.export_button.setToolTip("选择原列更新或新增公式对照列，将所有 Sheet 的已应用清洗及辅助列另存为新 .xlsx 文件。")
         heading.addWidget(self.export_button)
-        for text, tone in (("V0.9", "neutral"), ("另存为新文件", "success")):
+        for text, tone in (("V0.9.1", "neutral"), ("另存为新文件", "success")):
             badge = QLabel(text)
             badge.setProperty("role", "badge")
             badge.setProperty("tone", tone)
@@ -307,6 +311,8 @@ class MainWindow(QMainWindow):
         self.undo_button.clicked.connect(self._undo_last_action)
         self.restore_button.clicked.connect(self._restore_original)
         self.export_button.clicked.connect(self._export_results)
+        self.formula_button.clicked.connect(self._show_manual_formula)
+        self.cleaning_panel.formula_requested.connect(self._show_manual_formula)
         self.sheet_combo.currentTextChanged.connect(self._switch_sheet)
         self.table.horizontalHeader().sectionClicked.connect(self._select_column)
         self.table.horizontalHeader().sectionDoubleClicked.connect(self.table.resizeColumnToContents)
@@ -329,6 +335,7 @@ class MainWindow(QMainWindow):
     def _update_controls(self) -> None:
         busy = self._is_busy()
         self.open_button.setEnabled(not busy)
+        self.formula_button.setEnabled(not busy)
         self.scan_button.setEnabled(not busy and self._preview is not None)
         self.sheet_overview_panel.set_busy(busy, scanning=self._scan_worker is not None)
         self.empty_open_button.setEnabled(not busy)
@@ -607,6 +614,38 @@ class MainWindow(QMainWindow):
             return
         if action is not None:
             self._refresh_after_change(column, f"已恢复{sheet}工作表的原始数据")
+
+    @Slot()
+    def _show_manual_formula(self) -> None:
+        if self._is_busy():
+            return
+        column = self.selected_column
+        selected_rules = ()
+        strategy = "space"
+        # 批量页有独立的字段选择，不能误用上一次单列检测的字段或规则。
+        if self.results_tabs.currentWidget() is self.batch_panel:
+            config = self.batch_panel.selected_config
+            column = config.column_index if config and not config.is_generated else None
+            selected_rules = config.rules if column is not None else ()
+        elif column is not None:
+            rules = self.cleaning_panel.current_rules()
+            selected_rules = tuple(rule for rule in ALL_RULE_ORDER if getattr(rules, rule))
+            strategy = rules.hidden_strategy
+
+        column_name, reference = "", "A2"
+        if (self.data_manager.current_sheet is not None and column is not None
+                and 0 <= column < self.data_manager.original_df.shape[1]):
+            column_name = self._model.column_name(column)
+            reference = f"{get_column_letter(column + 1)}2"
+        else:
+            # 未导出的内存辅助列不对应源文件列；让用户明确填写源单元格。
+            selected_rules = ()
+        dialog = ManualFormulaDialog(
+            self, sheet_name=self.data_manager.current_sheet or "", column_name=column_name,
+            cell_reference=reference, selected_rules=selected_rules, hidden_strategy=strategy,
+        )
+        dialog.exec()
+        dialog.deleteLater()
 
     @Slot()
     def _export_results(self) -> None:

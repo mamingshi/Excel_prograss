@@ -20,6 +20,7 @@ from app.ui.type_rules_panel import TypeRulesPanel
 
 class CleaningPanel(QGroupBox):
     preview_requested = Signal()
+    formula_requested = Signal()
     preview_invalidated = Signal()
     annotation_requested = Signal()
     type_annotation_requested = Signal(str)
@@ -107,6 +108,9 @@ class CleaningPanel(QGroupBox):
         self.formula_edit.setFixedHeight(75)
         self.formula_edit.setPlaceholderText("完成检测后，参考公式随勾选规则更新。")
         formula_layout.addWidget(self.formula_edit)
+        self.formula_button = QPushButton("查看 / 复制清洗公式")
+        self.formula_button.clicked.connect(self.formula_requested.emit)
+        formula_layout.addWidget(self.formula_button)
         self.formula_note = QLabel(FORMULA_NOTE)
         self.formula_note.setWordWrap(True)
         self.formula_note.setProperty("role", "muted")
@@ -167,6 +171,7 @@ class CleaningPanel(QGroupBox):
 
     def set_busy(self, busy: bool) -> None:
         self._busy = busy
+        self.formula_button.setEnabled(not busy)
         enabled = not busy and self.analysis is not None and not self._is_generated
         self.annotation_button.setEnabled(enabled and self.analysis.counts["重复值"] > 0)
         self.generate_button.setEnabled(enabled)

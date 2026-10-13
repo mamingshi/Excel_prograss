@@ -167,6 +167,11 @@ class BatchCleaningPanel(QWidget):
         return self.config_model.configs
 
     @property
+    def selected_config(self):
+        """返回当前字段配置，供独立公式等只读工具使用。"""
+        return self.configs[self._selected_row] if 0 <= self._selected_row < len(self.configs) else None
+
+    @property
     def current_table(self):
         return self.config_table if self.pages.currentIndex() == 0 else self.preview_table
 
